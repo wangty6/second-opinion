@@ -8,7 +8,7 @@ When Claude Code stops (completes a task or pauses), the Stop hook:
 1. Reads the conversation transcript
 2. Formats it as context for review
 3. Sends it to a configured backend model (opencode, codex, gemini, or custom)
-4. Writes the review to `.claude/reviews/latest.md`
+4. Writes the review to `.claude/second-opinions/latest.md`
 5. Prints a summary in the transcript
 
 ## Prerequisites
@@ -36,7 +36,7 @@ bash /path/to/second-opinion/install.sh .
 
 1. Copy `.claude/hooks/second-opinion.py` to your project
 2. Copy `.claude/second-opinion.config.json` to your project
-3. Copy `.claude/commands/review.md` to your project
+3. Copy `.claude/commands/second-opinion.md` to your project
 4. Add the hook to `.claude/settings.local.json`:
 
 ```json
@@ -58,7 +58,7 @@ bash /path/to/second-opinion/install.sh .
 }
 ```
 
-5. Add `.claude/reviews/` to `.gitignore`
+5. Add `.claude/second-opinions/` to `.gitignore`
 
 ## Configuration
 
@@ -98,9 +98,9 @@ python3 .claude/hooks/second-opinion.py --transcript /path/to/transcript.jsonl -
 
 ### Read the Review
 
-In Claude Code, use the `/review` slash command, or tell Claude:
+In Claude Code, use the `/second-opinion` slash command, or tell Claude:
 
-> Read .claude/reviews/latest.md and address the issues found.
+> Read .claude/second-opinions/latest.md and address the issues found.
 
 ### CLI Flags
 
@@ -123,7 +123,7 @@ In Claude Code, use the `/review` slash command, or tell Claude:
 **Hook doesn't run:**
 - Verify `.claude/settings.local.json` has the Stop hook registered
 - Check `enabled` is `true` in config
-- Check cooldown hasn't been hit (delete `.claude/reviews/.last_run` to reset)
+- Check cooldown hasn't been hit (delete `.claude/second-opinions/.last_run` to reset)
 
 **Backend not found:**
 - Ensure the CLI is installed and on your PATH

@@ -33,8 +33,8 @@ else
 fi
 
 # Copy slash command
-cp "$SCRIPT_DIR/.claude/commands/review.md" "$TARGET_DIR/.claude/commands/review.md"
-echo "✓ Installed /review command"
+cp "$SCRIPT_DIR/.claude/commands/second-opinion.md" "$TARGET_DIR/.claude/commands/second-opinion.md"
+echo "✓ Installed /second-opinion command"
 
 # Update .gitignore
 GITIGNORE="$TARGET_DIR/.gitignore"
@@ -92,4 +92,4 @@ echo "─── Done ───"
 echo ""
 echo "Edit .claude/second-opinion.config.json to configure backend and options."
 echo "The hook will run automatically when Claude Code stops."
-echo "Use /review in Claude Code to see the latest review."
+echo "Use /second-opinion in Claude Code to trigger or view a review."

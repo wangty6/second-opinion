@@ -475,7 +475,7 @@ def print_summary(output: str, backend_name: str, success: bool) -> None:
     print(f"├{border}┤")
     print(f"│ Full review: .claude/reviews/latest.md")
     print(f"│ To apply: tell Claude to read .claude/reviews/latest.md")
-    print(f"│ Or use: /review")
+    print(f"│ Or use: /second-opinion")
     print(f"└{border}┘")
 
 
