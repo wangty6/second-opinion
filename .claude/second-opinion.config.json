@@ -1,0 +1,41 @@
+{
+  "enabled": true,
+  "auto_review_on_stop": true,
+  "backend": "opencode",
+  "max_context_messages": 20,
+  "max_context_chars": 30000,
+  "timeout": 300,
+  "cooldown": 30,
+  "min_assistant_length": 200,
+  "skip_patterns": ["^(yes|no|ok|sure|done|thanks)$", "^\\s*$"],
+  "review_language": "en",
+  "backends": {
+    "opencode": {
+      "command": "opencode",
+      "args_template": ["run", "{prompt}"],
+      "env": {}
+    },
+    "codex": {
+      "command": "codex",
+      "args_template": ["-q", "--approval-mode", "never", "{prompt}"],
+      "env": {}
+    },
+    "gemini": {
+      "command": "gemini",
+      "args_template": ["-p", "{prompt}"],
+      "env": {}
+    },
+    "openrouter": {
+      "command": "python3",
+      "args_template": [".claude/hooks/openrouter-backend.py", "{prompt}"],
+      "env": {
+        "OPENROUTER_MODEL": "deepseek/deepseek-chat-v3-0324"
+      }
+    },
+    "custom": {
+      "command": "",
+      "args_template": ["{prompt}"],
+      "env": {}
+    }
+  }
+}
