@@ -695,7 +695,32 @@ def main():
         progress(f"Prompt saved ({len(prompt)} chars). Ready for teammate dispatch.")
         return
 
-    # ── Full synchronous mode ──────────────────────────────────────────
+    # ── Hook mode: background the dispatch so we don't block Claude ──
+    if hook_mode:
+        # Save prompt to file, then spawn background process to dispatch
+        reviews_dir = os.path.join(cwd, ".claude", "reviews")
+        os.makedirs(reviews_dir, exist_ok=True)
+        prompt_path = os.path.join(reviews_dir, ".pending-prompt.txt")
+        with open(prompt_path, "w") as f:
+            f.write(prompt)
+
+        cmd = [
+            sys.executable, os.path.abspath(__file__),
+            "--dispatch", prompt_path,
+            "--cwd", cwd,
+            "--backend", backend_name,
+        ]
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=open(os.path.join(reviews_dir, ".dispatch.log"), "w"),
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        progress(f"Review dispatched to background ({backend_name}).")
+        return
+
+    # ── Full synchronous mode (manual CLI invocation) ─────────────────
     progress(f"Requesting review from {backend_name}...")
     success, output = dispatch_review(prompt, config, cwd, backend_override=args.backend)
     progress("Review received. Saving...")
