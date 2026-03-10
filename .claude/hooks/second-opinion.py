@@ -227,6 +227,78 @@ def extract_context(transcript_path: str, max_messages: int, max_chars: int) -> 
     return result
 
 
+# ─── File Content Reader ────────────────────────────────────────────────
+
+CODE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".kt",
+    ".c", ".cpp", ".h", ".rb", ".sh", ".bash", ".zsh",
+    ".md", ".json", ".yaml", ".yml", ".toml",
+}
+
+SKIP_DIRS = {"__pycache__", "node_modules", ".git"}
+
+MAX_FILE_SIZE = 100 * 1024  # 100KB
+
+
+def extract_file_content(paths: list[str], max_chars: int, cwd: str | None = None) -> str:
+    """Read files/directories and format as reviewable context."""
+    sections: list[str] = []
+    budget = max_chars
+    rel_base = cwd or os.getcwd()
+
+    def _add_file(filepath: str, display_path: str) -> None:
+        nonlocal budget
+        if budget <= 0:
+            return
+        # Skip files that are too large or binary
+        try:
+            size = os.path.getsize(filepath)
+            if size > MAX_FILE_SIZE or size == 0:
+                return
+        except OSError:
+            return
+
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="strict") as f:
+                content = f.read(budget)
+        except (OSError, UnicodeDecodeError):
+            return  # skip binary / unreadable files
+
+        if len(content) > budget:
+            content = content[:budget] + "\n... (truncated)"
+        sections.append(f"[FILE: {display_path}]\n{content}")
+        budget -= len(content)
+
+    for path in paths:
+        path = os.path.expanduser(path)
+        if not os.path.isabs(path):
+            path = os.path.join(rel_base, path)
+        path = os.path.abspath(path)
+
+        if os.path.isfile(path):
+            # Explicit file path: include regardless of extension (user chose it)
+            _add_file(path, os.path.relpath(path, rel_base))
+        elif os.path.isdir(path):
+            for root, dirs, files in os.walk(path):
+                # Prune skipped directories
+                dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+                dirs.sort()
+                for fname in sorted(files):
+                    _, ext = os.path.splitext(fname)
+                    if ext not in CODE_EXTENSIONS:
+                        continue
+                    fpath = os.path.join(root, fname)
+                    _add_file(fpath, os.path.relpath(fpath, rel_base))
+                    if budget <= 0:
+                        break
+                if budget <= 0:
+                    break
+        else:
+            progress(f"Warning: path not found: {path}")
+
+    return "\n\n".join(sections)
+
+
 # ─── Skip Logic ──────────────────────────────────────────────────────────────
 
 
@@ -275,14 +347,21 @@ def should_skip(config: dict, stdin_data: dict, force: bool = False) -> str | No
 # ─── Prompt Builder ──────────────────────────────────────────────────────────
 
 
-def build_review_prompt(context: str, config: dict) -> str:
+def build_review_prompt(context: str, config: dict, mode: str = "transcript") -> str:
     """Build the review prompt to send to the backend model."""
     lang = config.get("review_language", "en")
     lang_instruction = f"\nRespond in: {lang}" if lang != "en" else ""
 
+    if mode == "files":
+        intro = "Review the following code files."
+        context_label = "CODE FILES:"
+    else:
+        intro = "Review the following Claude Code session transcript."
+        context_label = "SESSION TRANSCRIPT:"
+
     return f"""You are a senior software engineer conducting a code review.
 
-Review the following Claude Code session transcript. Focus on:
+{intro} Focus on:
 1. **Correctness** — Logic errors, edge cases, off-by-one errors
 2. **Security** — Injection risks, exposed secrets, unsafe operations
 3. **Design** — Architecture issues, coupling, missing abstractions
@@ -304,7 +383,7 @@ One sentence on the overall risk level of the changes.
 {lang_instruction}
 ---
 
-SESSION TRANSCRIPT:
+{context_label}
 
 {context}"""
 
@@ -515,6 +594,10 @@ def main():
         "--dispatch", metavar="PROMPT_FILE",
         help="Dispatch only: read prompt from file, call backend, save review",
     )
+    parser.add_argument(
+        "--files", nargs="+",
+        help="Review specific files/directories instead of transcript",
+    )
     args = parser.parse_args()
 
     # ── Dispatch-only mode (called by teammate agent) ──────────────────────
@@ -570,26 +653,31 @@ def main():
         progress(f"Skipped: {skip_reason}")
         return
 
-    # Find transcript
-    transcript_path = args.transcript or stdin_data.get("transcript_path")
-    if not transcript_path:
-        transcript_path = find_transcript(cwd)
-    if transcript_path:
-        progress("Reading transcript...")
-
-    # Extract context
-    context = extract_context(
-        transcript_path,
-        config.get("max_context_messages", 20),
-        config.get("max_context_chars", 30000),
-    )
+    # Determine review mode: file-based or transcript-based
+    if args.files:
+        progress(f"Reading {len(args.files)} file/directory path(s)...")
+        context = extract_file_content(args.files, config.get("max_context_chars", 30000), cwd=cwd)
+        review_mode = "files"
+    else:
+        # Find transcript
+        transcript_path = args.transcript or stdin_data.get("transcript_path")
+        if not transcript_path:
+            transcript_path = find_transcript(cwd)
+        if transcript_path:
+            progress("Reading transcript...")
+        context = extract_context(
+            transcript_path,
+            config.get("max_context_messages", 20),
+            config.get("max_context_chars", 30000),
+        )
+        review_mode = "transcript"
 
     if not context.strip():
         progress("Nothing to review (empty context)")
         return
 
     # Build prompt
-    prompt = build_review_prompt(context, config)
+    prompt = build_review_prompt(context, config, mode=review_mode)
     backend_name = args.backend or config.get("backend", "opencode")
 
     # ── Prep-only: save prompt file and exit (for teammate mode) ───────
@@ -600,7 +688,10 @@ def main():
         with open(prompt_path, "w") as f:
             f.write(prompt)
         # Output the prompt path and backend on stdout for the caller
-        print(json.dumps({"prompt_file": prompt_path, "backend": backend_name}))
+        output_data = {"prompt_file": prompt_path, "backend": backend_name}
+        if args.files:
+            output_data["files"] = args.files
+        print(json.dumps(output_data))
         progress(f"Prompt saved ({len(prompt)} chars). Ready for teammate dispatch.")
         return
 

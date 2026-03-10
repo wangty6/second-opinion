@@ -4,8 +4,12 @@ Run a second-opinion code review using a **reviewer teammate** (agent team).
 
 ### 1. Prep — extract context and build prompt
 
+Determine what the user wants reviewed:
+- If the user mentions specific **files or directories** (e.g. "review the gpu commands in .claude/", "review src/main.py"), extract those paths and add `--files <path1> <path2> ...` to the command.
+- If no specific files are mentioned, omit `--files` — the hook will review the conversation transcript instead.
+
 ```bash
-python3 $CLAUDE_PROJECT_DIR/.claude/hooks/second-opinion.py --cwd $CLAUDE_PROJECT_DIR --force --prep-only
+python3 $CLAUDE_PROJECT_DIR/.claude/hooks/second-opinion.py --cwd $CLAUDE_PROJECT_DIR --force --prep-only [--files <path1> <path2> ...]
 ```
 
 If the user provided `--backend <name>`, append it to the command above.
