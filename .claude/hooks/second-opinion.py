@@ -3,16 +3,22 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional, Tuple
+
+def progress(msg: str) -> None:
+    """Print progress to stderr (visible in terminal, not in Claude transcript)."""
+    print(f"[second-opinion] {msg}", file=sys.stderr, flush=True)
+
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
 
@@ -56,7 +62,7 @@ DEFAULTS = {
 
 def load_config(cwd: str) -> dict:
     """Load config from .claude/second-opinion.config.json, merged with defaults."""
-    config = json.loads(json.dumps(DEFAULTS))  # deep copy
+    config = copy.deepcopy(DEFAULTS)
     config_path = os.path.join(cwd, ".claude", "second-opinion.config.json")
     try:
         with open(config_path, "r") as f:
@@ -100,6 +106,13 @@ def _extract_text(content) -> str:
     return str(content) if content else ""
 
 
+def _truncate(text: str, max_len: int = 500) -> str:
+    text = text.strip()
+    if len(text) > max_len:
+        return text[:max_len] + "\n... (truncated)"
+    return text
+
+
 def extract_context(transcript_path: str, max_messages: int, max_chars: int) -> str:
     """Parse a JSONL transcript file and extract formatted context.
 
@@ -110,15 +123,11 @@ def extract_context(transcript_path: str, max_messages: int, max_chars: int) -> 
     if not transcript_path or not os.path.isfile(transcript_path):
         return ""
 
-    lines = []
     try:
         with open(transcript_path, "r") as f:
-            lines = f.readlines()
+            tail = deque(f, maxlen=max_messages * 3)
     except OSError:
         return ""
-
-    # Take last N*3 lines to account for tool calls expanding message count
-    tail = lines[-(max_messages * 3) :]
 
     entries = []
     for raw_line in tail:
@@ -161,10 +170,7 @@ def extract_context(transcript_path: str, max_messages: int, max_chars: int) -> 
                         result_content = block.get("content", "")
                         text = _extract_text(result_content)
                         if text.strip():
-                            truncated = text.strip()[:500]
-                            if len(text.strip()) > 500:
-                                truncated += "\n... (truncated)"
-                            entries.append(f"[TOOL RESULT]\n{truncated}")
+                            entries.append(f"[TOOL RESULT]\n{_truncate(text)}")
             elif isinstance(content, str) and content.strip():
                 entries.append(f"[USER]\n{content.strip()}")
 
@@ -204,11 +210,7 @@ def extract_context(transcript_path: str, max_messages: int, max_chars: int) -> 
             # Tool results — include a brief summary
             text = _extract_text(content)
             if text.strip():
-                # Truncate long tool results
-                truncated = text.strip()[:500]
-                if len(text.strip()) > 500:
-                    truncated += "\n... (truncated)"
-                entries.append(f"[TOOL RESULT]\n{truncated}")
+                entries.append(f"[TOOL RESULT]\n{_truncate(text)}")
 
     result = "\n\n".join(entries)
 
@@ -259,12 +261,12 @@ def should_skip(config: dict, stdin_data: dict, force: bool = False) -> str | No
     last_run_path = os.path.join(cwd, ".claude", "reviews", ".last_run")
     cooldown = config.get("cooldown", 30)
     try:
-        if os.path.exists(last_run_path):
-            last_run = float(open(last_run_path).read().strip())
-            elapsed = time.time() - last_run
-            if elapsed < cooldown:
-                return f"cooldown ({int(cooldown - elapsed)}s remaining)"
-    except (ValueError, OSError):
+        with open(last_run_path) as f:
+            last_run = float(f.read().strip())
+        elapsed = time.time() - last_run
+        if elapsed < cooldown:
+            return f"cooldown ({int(cooldown - elapsed)}s remaining)"
+    except (FileNotFoundError, ValueError, OSError):
         pass
 
     return None
@@ -310,7 +312,15 @@ SESSION TRANSCRIPT:
 # ─── Backend Dispatcher ─────────────────────────────────────────────────────
 
 
-def dispatch_review(prompt: str, config: dict, backend_override: str | None = None) -> tuple:
+def _heartbeat(stop_event: threading.Event, backend_name: str) -> None:
+    """Emit periodic progress messages while waiting for backend response."""
+    start = time.time()
+    while not stop_event.wait(10):
+        elapsed = int(time.time() - start)
+        progress(f"  Waiting for {backend_name}... ({elapsed}s)")
+
+
+def dispatch_review(prompt: str, config: dict, cwd: str, backend_override: str | None = None) -> tuple:
     """Send prompt to the configured backend. Returns (success, output)."""
     backend_name = backend_override or config.get("backend", "opencode")
     backends = config.get("backends", {})
@@ -330,8 +340,10 @@ def dispatch_review(prompt: str, config: dict, backend_override: str | None = No
     prompt_file = None
     prompt_ref = prompt
     try:
-        prompt_file = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", prefix="second_opinion_", delete=False
+        reviews_dir = os.path.join(cwd, ".claude", "reviews")
+        os.makedirs(reviews_dir, exist_ok=True)
+        prompt_file = open(
+            os.path.join(reviews_dir, ".prompt.tmp"), "w"
         )
         prompt_file.write(prompt)
         prompt_file.close()
@@ -353,6 +365,9 @@ def dispatch_review(prompt: str, config: dict, backend_override: str | None = No
     for key, value in backend.get("env", {}).items():
         env[key] = str(value)
 
+    stop_event = threading.Event()
+    beat = threading.Thread(target=_heartbeat, args=(stop_event, backend_name), daemon=True)
+    beat.start()
     try:
         result = subprocess.run(
             cmd_list,
@@ -360,7 +375,7 @@ def dispatch_review(prompt: str, config: dict, backend_override: str | None = No
             text=True,
             timeout=timeout,
             env=env,
-            cwd=os.getcwd(),
+            cwd=cwd,
         )
         output = result.stdout.strip()
         if not output and result.stderr.strip():
@@ -375,6 +390,8 @@ def dispatch_review(prompt: str, config: dict, backend_override: str | None = No
     except OSError as e:
         return (False, f"Failed to run backend: {e}")
     finally:
+        stop_event.set()
+        beat.join(timeout=2)
         # Clean up temp file
         if prompt_file and os.path.exists(prompt_file.name):
             try:
@@ -428,55 +445,27 @@ def write_review(cwd: str, output: str, backend_name: str, success: bool) -> str
 
 
 def print_summary(output: str, backend_name: str, success: bool) -> None:
-    """Print a formatted summary to stdout (visible in Claude Code transcript)."""
+    """Print detailed review to stderr (terminal) and a brief pointer to stdout (Claude transcript)."""
     border = "─" * 50
-    print(f"\n┌{border}┐")
-    print(f"│ Second Opinion Review ({backend_name})")
-    print(f"├{border}┤")
+
+    # ── Detailed view on stderr (visible in terminal, not paraphrased by Claude) ──
+    print(f"\n┌{border}┐", file=sys.stderr)
+    print(f"│ Second Opinion Review ({backend_name})", file=sys.stderr)
+    print(f"├{border}┤", file=sys.stderr)
 
     if not success:
-        print(f"│ STATUS: FAILED")
-        # Show first few lines of error
+        print(f"│ STATUS: FAILED", file=sys.stderr)
         for line in output.split("\n")[:5]:
-            print(f"│ {line[:70]}")
-        print(f"└{border}┘")
-        return
-
-    # Try to parse verdict
-    verdict = "unknown"
-    verdict_match = re.search(r"##\s*Verdict\s*\n+(.+)", output, re.IGNORECASE)
-    if verdict_match:
-        verdict = verdict_match.group(1).strip()
-
-    print(f"│ VERDICT: {verdict}")
-    print(f"├{border}┤")
-
-    # Try to extract issues
-    issues_match = re.search(
-        r"##\s*Issues\s*\n([\s\S]*?)(?=\n##|\Z)", output, re.IGNORECASE
-    )
-    if issues_match:
-        issues_text = issues_match.group(1).strip()
-        issue_lines = [l for l in issues_text.split("\n") if l.strip()]
-        shown = 0
-        for line in issue_lines:
-            if shown >= 5:
-                remaining = len(issue_lines) - shown
-                if remaining > 0:
-                    print(f"│ ... and {remaining} more issues")
-                break
-            print(f"│ {line.strip()[:70]}")
-            shown += 1
+            print(f"│ {line[:70]}", file=sys.stderr)
+        print(f"└{border}┘", file=sys.stderr)
     else:
-        # Fallback: show first 10 lines
-        for line in output.split("\n")[:10]:
-            print(f"│ {line[:70]}")
+        for line in output.split("\n"):
+            print(f"│ {line[:70]}", file=sys.stderr)
+        print(f"└{border}┘", file=sys.stderr)
 
-    print(f"├{border}┤")
-    print(f"│ Full review: .claude/reviews/latest.md")
-    print(f"│ To apply: tell Claude to read .claude/reviews/latest.md")
-    print(f"│ Or use: /second-opinion")
-    print(f"└{border}┘")
+    # ── Minimal stdout (Claude sees this — just a pointer, not the full review) ──
+    status = "completed" if success else "FAILED"
+    print(f"Second Opinion review {status}. Read .claude/reviews/latest.md for details.")
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
@@ -518,8 +507,45 @@ def main():
     parser.add_argument("--cwd", help="Working directory (overrides auto-detection)")
     parser.add_argument("--force", action="store_true", help="Bypass cooldown and length checks")
     parser.add_argument("--backend", help="Override configured backend")
+    parser.add_argument(
+        "--prep-only", action="store_true",
+        help="Prep only: skip checks, extract context, save prompt to file, then exit",
+    )
+    parser.add_argument(
+        "--dispatch", metavar="PROMPT_FILE",
+        help="Dispatch only: read prompt from file, call backend, save review",
+    )
     args = parser.parse_args()
 
+    # ── Dispatch-only mode (called by teammate agent) ──────────────────────
+    if args.dispatch:
+        cwd = args.cwd or os.getcwd()
+        config = load_config(cwd)
+        backend_name = args.backend or config.get("backend", "opencode")
+
+        prompt_file = args.dispatch
+        try:
+            with open(prompt_file) as f:
+                prompt = f.read()
+        except OSError as e:
+            print(f"Error reading prompt file: {e}", file=sys.stderr)
+            return
+
+        progress(f"Requesting review from {backend_name}...")
+        success, output = dispatch_review(prompt, config, cwd, backend_override=args.backend)
+        progress("Review received. Saving...")
+
+        write_review(cwd, output, backend_name, success)
+        print_summary(output, backend_name, success)
+
+        # Clean up prompt file
+        try:
+            os.unlink(prompt_file)
+        except OSError:
+            pass
+        return
+
+    # ── Normal / prep-only mode ────────────────────────────────────────────
     # Determine mode: hook (stdin JSON) or manual (CLI args)
     stdin_data = {}
     hook_mode = not sys.stdin.isatty()
@@ -541,13 +567,15 @@ def main():
     force = args.force
     skip_reason = should_skip(config, stdin_data, force=force)
     if skip_reason:
-        # Silent skip — don't pollute transcript
+        progress(f"Skipped: {skip_reason}")
         return
 
     # Find transcript
     transcript_path = args.transcript or stdin_data.get("transcript_path")
     if not transcript_path:
         transcript_path = find_transcript(cwd)
+    if transcript_path:
+        progress("Reading transcript...")
 
     # Extract context
     context = extract_context(
@@ -557,15 +585,29 @@ def main():
     )
 
     if not context.strip():
-        # Nothing meaningful to review
+        progress("Nothing to review (empty context)")
         return
 
     # Build prompt
     prompt = build_review_prompt(context, config)
-
-    # Dispatch to backend
     backend_name = args.backend or config.get("backend", "opencode")
-    success, output = dispatch_review(prompt, config, backend_override=args.backend)
+
+    # ── Prep-only: save prompt file and exit (for teammate mode) ───────
+    if args.prep_only:
+        reviews_dir = os.path.join(cwd, ".claude", "reviews")
+        os.makedirs(reviews_dir, exist_ok=True)
+        prompt_path = os.path.join(reviews_dir, ".pending-prompt.txt")
+        with open(prompt_path, "w") as f:
+            f.write(prompt)
+        # Output the prompt path and backend on stdout for the caller
+        print(json.dumps({"prompt_file": prompt_path, "backend": backend_name}))
+        progress(f"Prompt saved ({len(prompt)} chars). Ready for teammate dispatch.")
+        return
+
+    # ── Full synchronous mode ──────────────────────────────────────────
+    progress(f"Requesting review from {backend_name}...")
+    success, output = dispatch_review(prompt, config, cwd, backend_override=args.backend)
+    progress("Review received. Saving...")
 
     # Write review
     write_review(cwd, output, backend_name, success)

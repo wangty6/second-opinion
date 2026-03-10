@@ -14,9 +14,11 @@ def main():
     prompt = sys.argv[1]
 
     # If the argument looks like a file path, read from it
-    if os.path.isfile(prompt):
+    try:
         with open(prompt) as f:
             prompt = f.read()
+    except (FileNotFoundError, IsADirectoryError, OSError):
+        pass  # treat as literal prompt string
 
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     if not api_key:
