@@ -5,9 +5,114 @@ set -euo pipefail
 # Installs the hook, config, and slash command into the current project.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TARGET_DIR="${1:-.}"
+
+# ─── Parse flags ────────────────────────────────────────────────────────
+UNINSTALL=false
+POSITIONAL=()
+for arg in "$@"; do
+    case "$arg" in
+        --uninstall) UNINSTALL=true ;;
+        *) POSITIONAL+=("$arg") ;;
+    esac
+done
+
+TARGET_DIR="${POSITIONAL[0]:-.}"
 TARGET_DIR="$(cd "$TARGET_DIR" && pwd)"
 
+# ─── Uninstall ──────────────────────────────────────────────────────────
+if $UNINSTALL; then
+    echo "Second Opinion Plugin — Uninstaller"
+    echo "===================================="
+    echo "Target:  $TARGET_DIR"
+    echo ""
+
+    # Remove hook script
+    if [ -f "$TARGET_DIR/.claude/hooks/second-opinion.py" ]; then
+        rm "$TARGET_DIR/.claude/hooks/second-opinion.py"
+        echo "✓ Removed hook script"
+    fi
+
+    # Remove OpenRouter backend (installed alongside the hook)
+    if [ -f "$TARGET_DIR/.claude/hooks/openrouter-backend.py" ]; then
+        rm "$TARGET_DIR/.claude/hooks/openrouter-backend.py"
+        echo "✓ Removed openrouter backend"
+    fi
+
+    # Remove slash command
+    if [ -f "$TARGET_DIR/.claude/commands/second-opinion.md" ]; then
+        rm "$TARGET_DIR/.claude/commands/second-opinion.md"
+        echo "✓ Removed /second-opinion command"
+    fi
+
+    # Remove config
+    if [ -f "$TARGET_DIR/.claude/second-opinion.config.json" ]; then
+        rm "$TARGET_DIR/.claude/second-opinion.config.json"
+        echo "✓ Removed config"
+    fi
+
+    # Remove reviews directory
+    if [ -d "$TARGET_DIR/.claude/reviews" ]; then
+        rm -rf "$TARGET_DIR/.claude/reviews"
+        echo "✓ Removed reviews directory"
+    fi
+
+    # Clean up hook registration from settings.local.json
+    SETTINGS="$TARGET_DIR/.claude/settings.local.json"
+    if [ -f "$SETTINGS" ] && grep -q "second-opinion" "$SETTINGS" 2>/dev/null; then
+        # Use python3 to safely remove the hook entry from JSON
+        python3 -c "
+import json, sys
+with open('$SETTINGS') as f:
+    settings = json.load(f)
+hooks = settings.get('hooks', {})
+for event in list(hooks.keys()):
+    hooks[event] = [
+        entry for entry in hooks[event]
+        if not any('second-opinion' in h.get('command', '') for h in entry.get('hooks', []))
+    ]
+    if not hooks[event]:
+        del hooks[event]
+if not hooks:
+    del settings['hooks']
+if settings:
+    with open('$SETTINGS', 'w') as f:
+        json.dump(settings, f, indent=2)
+        f.write('\n')
+else:
+    import os
+    os.unlink('$SETTINGS')
+" 2>/dev/null && echo "✓ Removed hook registration from settings" || echo "• Could not auto-clean settings — remove the second-opinion hook entry from $SETTINGS manually"
+    fi
+
+    # Clean up .gitignore entries
+    GITIGNORE="$TARGET_DIR/.gitignore"
+    if [ -f "$GITIGNORE" ] && grep -q ".claude/reviews/" "$GITIGNORE" 2>/dev/null; then
+        python3 -c "
+lines = open('$GITIGNORE').readlines()
+out = [l for l in lines if '# Second Opinion reviews' not in l and '.claude/reviews/' not in l]
+# Remove trailing blank lines
+while out and out[-1].strip() == '':
+    out.pop()
+if out:
+    with open('$GITIGNORE', 'w') as f:
+        f.writelines(out)
+        if not out[-1].endswith('\n'):
+            f.write('\n')
+" 2>/dev/null && echo "✓ Cleaned .gitignore" || true
+    fi
+
+    # Remove empty .claude subdirs if we left them empty
+    rmdir "$TARGET_DIR/.claude/hooks" 2>/dev/null && echo "✓ Removed empty hooks directory" || true
+    rmdir "$TARGET_DIR/.claude/commands" 2>/dev/null && echo "✓ Removed empty commands directory" || true
+
+    echo ""
+    echo "─── Uninstall complete ───"
+    echo ""
+    echo "Second Opinion has been fully removed from $TARGET_DIR"
+    exit 0
+fi
+
+# ─── Install ────────────────────────────────────────────────────────────
 echo "Second Opinion Plugin — Installer"
 echo "================================="
 echo "Source:  $SCRIPT_DIR"
